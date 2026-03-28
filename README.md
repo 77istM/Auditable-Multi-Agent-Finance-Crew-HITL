@@ -28,7 +28,7 @@ Submit request
 
 | Node | Role | Tool |
 |---|---|---|
-| **Investigator** (A) | Calls TrueLayer Sandbox to confirm the original payment exists and is cleared | TrueLayer `/data/v1/accounts/{id}/transactions` |
+| **Investigator** (A) | Calls TrueLayer Sandbox to confirm the original payment exists and is cleared | stripe `/data/v1/accounts/{id}/transactions` |
 | **Risk Auditor** (B) | Queries SQLite to count refunds this month; computes a 0–99 risk score | SQLite `refund_requests` table |
 | **Executor** (C) | Calls `interrupt()` to pause the graph; on human approval, creates the refund via Stripe | `stripe-agent-toolkit` |
 
@@ -63,10 +63,9 @@ cp .env.example .env
 |---|---|
 | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
 | `STRIPE_SECRET_KEY` | Stripe Dashboard → Test Mode → Restricted Key (Refunds: Write) |
-| `TRUELAYER_CLIENT_ID` | [console.truelayer.com](https://console.truelayer.com) Sandbox |
-| `TRUELAYER_CLIENT_SECRET` | Same TrueLayer sandbox app |
 
-> **No credentials?** The system runs in **mock mode** automatically — TrueLayer verification and Stripe execution are simulated so you can demo the full HITL flow without any API accounts.
+
+> **No credentials?** The system runs in **mock mode** automatically —  Stripe execution are simulated so you can demo the full HITL flow without any API accounts.
 
 ### 3 — Run the app
 
@@ -87,8 +86,7 @@ Open `http://localhost:8501` in your browser.
 ```toml
 GROQ_API_KEY = "gsk_..."
 STRIPE_SECRET_KEY = "rk_test_..."
-TRUELAYER_CLIENT_ID = "..."
-TRUELAYER_CLIENT_SECRET = "..."
+
 ```
 
 ---
@@ -124,7 +122,7 @@ TRUELAYER_CLIENT_SECRET = "..."
 |---|---|---|
 | Orchestration | LangGraph 1.1 | Free |
 | LLM | Groq API (Llama 3) | Free tier |
-| Banking API | TrueLayer Sandbox | Free |
+| Banking API | stripe Sandbox | Free |
 | Payment API | Stripe Agent Toolkit | Free test mode |
 | Audit Logs | SQLite (built-in) | Free |
 | UI | Streamlit | Free |
