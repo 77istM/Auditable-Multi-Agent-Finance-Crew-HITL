@@ -22,11 +22,17 @@ from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
+from pydantic import BaseModel, Field
 
 import database
 import truelayer
 
 load_dotenv()
+
+# ── LangSmith observability (set LANGSMITH_API_KEY in .env to enable tracing) ─
+if os.getenv("LANGSMITH_API_KEY"):
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
 
 
 def _get_groq_llm() -> "ChatGroq | None":
@@ -35,6 +41,47 @@ def _get_groq_llm() -> "ChatGroq | None":
     if not api_key or api_key.startswith("your_"):
         return None
     return ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key, temperature=0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pydantic structured-output models
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LLMRiskVerdict(BaseModel):
+    """Strictly-typed LLM verdict returned by the Groq Risk Auditor."""
+
+    verdict: str = Field(
+        ...,
+        description="Either 'approve' or 'reject'",
+    )
+    reasoning: str = Field(
+        ...,
+        description="One concise sentence explaining the fraud-risk verdict",
+    )
+
+
+class RiskReport(BaseModel):
+    """Structured output produced by the Risk Auditor node.
+
+    Using a Pydantic model prevents the node from ever returning a malformed
+    dict and makes every field type-checked at construction time.
+    """
+
+    risk_score: int = Field(..., ge=0, le=99, description="Fraud risk score (0–99)")
+    flags: List[str] = Field(
+        default_factory=list, description="Detected risk flags"
+    )
+    monthly_refund_count: int = Field(
+        ..., ge=0, description="Refund requests this calendar month for this user"
+    )
+    auto_rejected: bool = Field(
+        False, description="True when risk score ≥ 80 triggers automatic rejection"
+    )
+    llm_insight: Optional[str] = Field(
+        None, description="Groq LLM narrative analysis (present only when API key is set)"
+    )
+    details: str = Field(..., description="Audit-log summary string")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared state
@@ -97,7 +144,12 @@ def investigator_node(state: FinanceState) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def risk_auditor_node(state: FinanceState) -> dict:
-    """Queries the local SQLite database to compute a fraud-risk score."""
+    """Queries the local SQLite database to compute a fraud-risk score.
+
+    Returns a strictly typed :class:`RiskReport` object (validated via Pydantic)
+    before writing to the audit log, preventing malformed outputs from reaching
+    downstream nodes.
+    """
     logs: List[str] = list(state.get("audit_logs", []))
     request = state["refund_request"]
     request_id: Optional[int] = state.get("request_id")
@@ -141,10 +193,8 @@ def risk_auditor_node(state: FinanceState) -> dict:
 
     logs.append(f"📊 [Risk Auditor] Final risk score: {risk_score}/99")
 
-    details = f"Score: {risk_score}; Flags: {'; '.join(flags) or 'none'}"
-    database.log_audit(request_id, "RiskAuditor", "risk_assessment", details)
-
-    # ── Groq LLM narrative analysis (optional, skipped if key absent) ─────────
+    # ── Groq LLM narrative analysis via structured output (optional) ──────────
+    llm_insight: Optional[str] = None
     llm = _get_groq_llm()
     if llm:
         prompt = (
@@ -153,28 +203,43 @@ def risk_auditor_node(state: FinanceState) -> dict:
             f"Rule-based risk score: {risk_score}/99. "
             f"Risk flags: {'; '.join(flags) if flags else 'none'}. "
             f"Refund requests this calendar month from this customer: {monthly_count}. "
-            f"In one concise sentence, state your fraud-risk verdict and whether "
-            f"you recommend approving or rejecting this refund."
+            f"Return a structured verdict with your recommendation."
         )
         try:
-            response = llm.invoke([HumanMessage(content=prompt)])
-            llm_insight = response.content.strip()
+            structured_llm = llm.with_structured_output(LLMRiskVerdict)
+            verdict: LLMRiskVerdict = structured_llm.invoke([HumanMessage(content=prompt)])
+            llm_insight = f"{verdict.verdict.upper()}: {verdict.reasoning}"
             logs.append(f"🤖 [Groq LLM] {llm_insight}")
             database.log_audit(request_id, "RiskAuditor", "llm_analysis", llm_insight)
         except Exception as llm_exc:  # LLM is an optional enhancement; never block the flow
             logs.append(f"⚠️  [Groq LLM] Analysis unavailable: {llm_exc}")
     # ─────────────────────────────────────────────────────────────────────────
 
-    if risk_score >= 80:
-        logs.append("🚫 [Risk Auditor] Score ≥ 80 — auto-rejecting request.")
-        database.update_refund_status(request_id, "rejected", risk_score)
-        return {"risk_score": risk_score, "audit_logs": logs, "status": "rejected"}
+    auto_rejected = risk_score >= 80
+    details = f"Score: {risk_score}; Flags: {'; '.join(flags) or 'none'}"
 
-    database.update_refund_status(request_id, "awaiting_approval", risk_score)
+    # Build and validate the structured report — raises ValidationError on bad data
+    report = RiskReport(
+        risk_score=risk_score,
+        flags=flags,
+        monthly_refund_count=monthly_count,
+        auto_rejected=auto_rejected,
+        llm_insight=llm_insight,
+        details=details,
+    )
+
+    database.log_audit(request_id, "RiskAuditor", "risk_assessment", report.details)
+
+    if report.auto_rejected:
+        logs.append("🚫 [Risk Auditor] Score ≥ 80 — auto-rejecting request.")
+        database.update_refund_status(request_id, "rejected", report.risk_score)
+        return {"risk_score": report.risk_score, "audit_logs": logs, "status": "rejected"}
+
+    database.update_refund_status(request_id, "awaiting_approval", report.risk_score)
     logs.append("⏸️  [Risk Auditor] Routing to executor — awaiting human approval.")
 
     return {
-        "risk_score": risk_score,
+        "risk_score": report.risk_score,
         "audit_logs": logs,
         "status": "awaiting_approval",
     }

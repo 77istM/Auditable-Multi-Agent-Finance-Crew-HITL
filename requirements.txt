@@ -16,3 +16,6 @@ streamlit==1.55.0
 # Utilities
 python-dotenv==1.2.2
 requests==2.31.0
+
+# Agentic evaluation
+deepeval>=3.0.0
