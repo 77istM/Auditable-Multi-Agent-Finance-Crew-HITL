@@ -1,0 +1,22 @@
+# Environment variables (never commit real keys)
+.env
+
+# SQLite audit database (runtime artefact)
+audit.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit cache
+.streamlit/secrets.toml
