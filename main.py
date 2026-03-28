@@ -17,6 +17,8 @@ import os
 from typing import TypedDict, List, Optional
 
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
@@ -25,6 +27,14 @@ import database
 import truelayer
 
 load_dotenv()
+
+
+def _get_groq_llm() -> "ChatGroq | None":
+    """Return a ChatGroq instance if GROQ_API_KEY is configured, else None."""
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key or api_key.startswith("your_"):
+        return None
+    return ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key, temperature=0)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared state
@@ -134,6 +144,27 @@ def risk_auditor_node(state: FinanceState) -> dict:
     details = f"Score: {risk_score}; Flags: {'; '.join(flags) or 'none'}"
     database.log_audit(request_id, "RiskAuditor", "risk_assessment", details)
 
+    # ── Groq LLM narrative analysis (optional, skipped if key absent) ─────────
+    llm = _get_groq_llm()
+    if llm:
+        prompt = (
+            f"You are a fraud analyst for an e-commerce store. "
+            f"A customer (ID: '{user_id}') is requesting a £{amount:.2f} refund. "
+            f"Rule-based risk score: {risk_score}/99. "
+            f"Risk flags: {'; '.join(flags) if flags else 'none'}. "
+            f"Refund requests this calendar month from this customer: {monthly_count}. "
+            f"In one concise sentence, state your fraud-risk verdict and whether "
+            f"you recommend approving or rejecting this refund."
+        )
+        try:
+            response = llm.invoke([HumanMessage(content=prompt)])
+            llm_insight = response.content.strip()
+            logs.append(f"🤖 [Groq LLM] {llm_insight}")
+            database.log_audit(request_id, "RiskAuditor", "llm_analysis", llm_insight)
+        except Exception as llm_exc:  # LLM is an optional enhancement; never block the flow
+            logs.append(f"⚠️  [Groq LLM] Analysis unavailable: {llm_exc}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     if risk_score >= 80:
         logs.append("🚫 [Risk Auditor] Score ≥ 80 — auto-rejecting request.")
         database.update_refund_status(request_id, "rejected", risk_score)
@@ -242,7 +273,7 @@ def executor_node(state: FinanceState) -> dict:
         database.update_refund_status(request_id, "executed", stripe_refund_id=refund_id)
         return {"audit_logs": logs, "status": "executed", "stripe_refund_id": refund_id}
 
-    except (RuntimeError, ValueError, KeyError, ImportError, OSError) as exc:  # Stripe / network errors
+    except Exception as exc:  # Stripe SDK / network errors can vary widely
         error_msg = str(exc)
         logs.append(f"❌ [Executor] Stripe error: {error_msg}")
         database.log_audit(request_id, "Executor", "refund_failed", error_msg)

@@ -99,7 +99,7 @@ TRUELAYER_CLIENT_SECRET = "..."
 ├── app.py            # Streamlit UI (sidebar form, log panel, HITL approval, audit table)
 ├── main.py           # LangGraph graph definition + three agent nodes
 ├── database.py       # SQLite helpers (schema, CRUD, audit trail)
-├── truely_layer.py   # TrueLayer Sandbox wrapper (+ mock fallback)
+├── truelayer.py      # TrueLayer Sandbox wrapper (+ mock fallback)
 ├── requirements.txt  # Pinned dependencies
 ├── .env.example      # Environment variable template
 └── .gitignore

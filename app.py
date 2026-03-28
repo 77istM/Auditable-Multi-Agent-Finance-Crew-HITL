@@ -12,14 +12,20 @@ state persists across page interactions within the same process.  Each request
 gets its own thread_id, keeping concurrent sessions isolated.
 """
 
+import os
 import uuid
 from typing import Optional
 
 import streamlit as st
 from langgraph.types import Command
 
-import database
-from main import build_graph
+# ── Streamlit Cloud: sync secrets → os.environ so dotenv-free code can read them
+for _key in ("GROQ_API_KEY", "STRIPE_SECRET_KEY", "TRUELAYER_CLIENT_ID", "TRUELAYER_CLIENT_SECRET"):
+    if _key in st.secrets and not os.environ.get(_key):
+        os.environ[_key] = st.secrets[_key]
+
+import database  # noqa: E402  (must come after the env-sync above)
+from main import build_graph  # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cached graph (shared across reruns; checkpointer keeps per-thread state)
