@@ -313,26 +313,15 @@ def executor_node(state: FinanceState) -> dict:
 
     # ── Real Stripe call ──────────────────────────────────────────────────────
     try:
-        from stripe_agent_toolkit.langchain import StripeAgentToolkit
+        import stripe
 
-        toolkit = StripeAgentToolkit(
-            secret_key=stripe_key,
-            configuration={"actions": {"refunds": {"create": True}}},
+        stripe.api_key = stripe_key
+        refund = stripe.Refund.create(
+            payment_intent=request.get("transaction_id"),
+            amount=int(float(request.get("amount", 0)) * 100),  # pence
+            reason="requested_by_customer",
         )
-        stripe_tools = toolkit.get_tools()
-        create_refund = next(
-            (t for t in stripe_tools if "refund" in t.name.lower()), None
-        )
-
-        if create_refund is None:
-            raise RuntimeError("create_refund tool not found in StripeAgentToolkit")
-
-        result = create_refund.invoke({
-            "amount": int(float(request.get("amount", 0)) * 100),  # pence
-            "payment_intent": request.get("transaction_id"),
-            "reason": "requested_by_customer",
-        })
-        refund_id = str(result)
+        refund_id = refund.id
         logs.append(f"💳 [Executor] Stripe refund executed: {refund_id}")
         database.log_audit(request_id, "Executor", "refund_created", f"Stripe ID: {refund_id}")
         database.update_refund_status(request_id, "executed", stripe_refund_id=refund_id)
