@@ -94,14 +94,67 @@ STRIPE_SECRET_KEY = "rk_test_..."
 ## File Structure
 
 ```
-├── app.py            # Streamlit UI (sidebar form, log panel, HITL approval, audit table)
-├── main.py           # LangGraph graph definition + three agent nodes
-├── database.py       # SQLite helpers (schema, CRUD, audit trail)
-├── truelayer.py      # TrueLayer Sandbox wrapper (+ mock fallback)
-├── requirements.txt  # Pinned dependencies
-├── .env.example      # Environment variable template
+├── app.py                    # Streamlit UI (sidebar form, log panel, HITL approval, audit table)
+├── main.py                   # LangGraph graph definition + three agent nodes
+├── database.py               # SQLite helpers (schema, CRUD, audit trail)
+├── truelayer.py              # TrueLayer Sandbox wrapper (+ mock fallback)
+├── truelayer_mcp_server.py   # MCP server — exposes banking tools to any MCP client
+├── requirements.txt          # Pinned dependencies
+├── .env.example              # Environment variable template
 └── .gitignore
 ```
+
+---
+
+## Model Context Protocol (MCP) Server
+
+`truelayer_mcp_server.py` wraps the TrueLayer banking tools as a standard **MCP server** so that any MCP-compatible AI (Claude Desktop, Cursor, Continue, etc.) can call them without any extra integration code.
+
+### Tools exposed
+
+| Tool | Description |
+|---|---|
+| `verify_transaction` | Confirm that a transaction ID exists in TrueLayer and matches an expected GBP amount |
+| `get_accounts` | List all bank accounts accessible with the current credentials |
+| `get_transactions` | Return recent transactions for a specific account |
+
+All three tools fall back to realistic **mock responses** when `TRUELAYER_CLIENT_ID` / `TRUELAYER_CLIENT_SECRET` are not set, so the server is fully usable offline.
+
+### Running the server
+
+```bash
+# stdio transport (Claude Desktop, most MCP hosts)
+python truelayer_mcp_server.py
+
+# HTTP/SSE transport (web-based clients)
+python truelayer_mcp_server.py --transport sse
+```
+
+### Connecting Claude Desktop
+
+Add the following block to your Claude Desktop config file.
+
+**macOS** — `~/Library/Application Support/Claude/claude_desktop_config.json`  
+**Windows** — `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "truelayer-banking": {
+      "command": "python",
+      "args": ["/absolute/path/to/truelayer_mcp_server.py"],
+      "env": {
+        "TRUELAYER_CLIENT_ID": "your_truelayer_client_id_here",
+        "TRUELAYER_CLIENT_SECRET": "your_truelayer_client_secret_here"
+      }
+    }
+  }
+}
+```
+
+> **Tip:** omit the `env` block (or leave the values as-is) to run in **mock mode** — Claude will still be able to call all three tools and receive realistic sandbox responses.
+
+After saving the config, restart Claude Desktop.  You should see **TrueLayer Banking Tools** listed under *Connected MCP Servers* in the app settings.
 
 ---
 

@@ -19,3 +19,6 @@ requests==2.31.0
 
 # Agentic evaluation
 deepeval>=3.0.0
+
+# Model Context Protocol — MCP server for banking tools
+mcp>=1.23.0
