@@ -1,7 +1,7 @@
 """
 Agentic Evaluation — Risk Auditor Golden Dataset.
 
-Runs 20 hand-crafted test cases through the Risk Auditor node using DeepEval
+Runs 25 hand-crafted test cases through the Risk Auditor node using DeepEval
 and prints a success-rate report.  No real database, external API, or LLM key
 is required — all I/O is mocked via unittest.mock.
 
@@ -81,18 +81,18 @@ class RiskAssessmentAccuracyMetric(BaseMetric):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Case runner — mocks DB so no real SQLite is needed
+# Case runner — mocks all DB calls so no real SQLite / Postgres is needed
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run_case(case: dict) -> dict:
-    """Run one golden-dataset case through the Risk Auditor node (DB mocked)."""
+    """Run one golden-dataset case through the Risk Auditor node (all DB mocked)."""
     state: dict = {
         "refund_request": dict(case["input"]),
         "transaction_verified": case["transaction_verified"],
         "risk_score": 0,
         "audit_logs": [],
         "status": "investigating",
-        "request_id": 9999,   # synthetic ID — DB operations are patched below
+        "request_id": 9999,   # synthetic ID — all DB operations are patched below
         "stripe_refund_id": None,
     }
     with (
@@ -100,9 +100,31 @@ def _run_case(case: dict) -> dict:
             "database.get_monthly_refund_count",
             return_value=case["monthly_refund_count"],
         ),
+        patch(
+            "database.get_duplicate_count",
+            return_value=case["duplicate_count"],
+        ),
+        patch(
+            "database.get_user_avg_refund_amount",
+            return_value=case["user_avg_amount"],
+        ),
+        patch(
+            "database.get_recent_count_24h",
+            return_value=case["recent_24h_count"],
+        ),
+        patch(
+            "database.get_tx_user_count",
+            return_value=case["tx_user_count"],
+        ),
+        patch(
+            "database.get_total_user_refund_count",
+            return_value=case["total_user_count"],
+        ),
         patch("database.log_audit"),
         patch("database.update_refund_status"),
-        patch("main._get_groq_llm", return_value=None),  # skip LLM during eval
+        patch("main._get_groq_llm", return_value=None),   # skip LLM during eval
+        patch("main._get_ml_model", return_value=None),   # skip ML during eval
+        patch("notifications.send_hitl_notification"),    # skip notifications
     ):
         result = finance_main.risk_auditor_node(state)
 
@@ -171,15 +193,15 @@ def run_evaluation() -> None:
     total = len(results)
     pct = 100.0 * passed / total if total else 0.0
 
-    print("\n" + "─" * 64)
+    print("\n" + "-" * 64)
     print(f"  SUCCESS RATE: {passed}/{total} ({pct:.1f}%)")
-    print("─" * 64)
+    print("-" * 64)
 
     if passed < total:
-        print("\n  ✗ FAILED CASES:")
+        print("\n  FAILED CASES:")
         for r in results:
             if not r["passed"]:
-                print(f"    • {r['label']}")
+                print(f"    * {r['label']}")
                 print(f"      Expected : {r['expected']}")
                 print(f"      Actual   : {r['actual']}")
                 print(f"      Reason   : {r['reason']}")

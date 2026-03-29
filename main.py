@@ -14,6 +14,7 @@ resumes after the operator sends `Command(resume={"approved": True/False})`.
 """
 
 import os
+from pathlib import Path
 from typing import TypedDict, List, Optional
 
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 import database
+import notifications
 import truelayer
 
 load_dotenv()
@@ -41,6 +43,27 @@ def _get_groq_llm() -> "ChatGroq | None":
     if not api_key or api_key.startswith("your_"):
         return None
     return ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key, temperature=0)
+
+
+# ── IsolationForest ML model (lazy-loaded, cached at module level) ─────────────
+
+_ISO_FOREST = None  # type: ignore[assignment]
+
+
+def _get_ml_model():
+    """Load and cache the IsolationForest anomaly detector (None if unavailable)."""
+    global _ISO_FOREST
+    if _ISO_FOREST is not None:
+        return _ISO_FOREST
+    pkl_path = Path(__file__).parent / "model" / "isolation_forest.pkl"
+    if not pkl_path.exists():
+        return None
+    try:
+        import joblib
+        _ISO_FOREST = joblib.load(pkl_path)
+    except Exception:
+        pass
+    return _ISO_FOREST
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,6 +103,10 @@ class RiskReport(BaseModel):
     llm_insight: Optional[str] = Field(
         None, description="Groq LLM narrative analysis (present only when API key is set)"
     )
+    ml_anomaly_score: Optional[float] = Field(
+        None, description="IsolationForest decision-function value (more negative = more anomalous)"
+    )
+    ml_boost: int = Field(0, description="Risk points contributed by the ML model")
     details: str = Field(..., description="Audit-log summary string")
 
 
@@ -144,7 +171,7 @@ def investigator_node(state: FinanceState) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def risk_auditor_node(state: FinanceState) -> dict:
-    """Queries the local SQLite database to compute a fraud-risk score.
+    """Compute a fraud-risk score using deterministic rules and an ML anomaly detector.
 
     Returns a strictly typed :class:`RiskReport` object (validated via Pydantic)
     before writing to the audit log, preventing malformed outputs from reaching
@@ -167,15 +194,26 @@ def risk_auditor_node(state: FinanceState) -> dict:
 
     user_id = str(request.get("user_id", ""))
     amount = float(request.get("amount", 0.0))
+    transaction_id = str(request.get("transaction_id", ""))
 
+    # ── Gather signals ────────────────────────────────────────────────────────
     monthly_count = database.get_monthly_refund_count(user_id)
+    dup_count = database.get_duplicate_count(user_id, transaction_id)
+    user_avg = database.get_user_avg_refund_amount(user_id)
+    recent_24h = database.get_recent_count_24h(user_id)
+    tx_user_count = database.get_tx_user_count(transaction_id)
+    total_count = database.get_total_user_refund_count(user_id)
 
+    # ── Deterministic rule-based scoring ─────────────────────────────────────
     risk_score = 0
     flags: List[str] = []
 
+    # — Existing rules —
     if monthly_count >= 3:
         risk_score += 60
-        flags.append(f"high refund frequency ({monthly_count} requests this month, ≥3 threshold)")
+        flags.append(
+            f"high refund frequency ({monthly_count} requests this month, ≥3 threshold)"
+        )
 
     if amount > 500:
         risk_score += 30
@@ -184,7 +222,78 @@ def risk_auditor_node(state: FinanceState) -> dict:
         risk_score += 15
         flags.append(f"medium amount £{amount:.2f} (>£200)")
 
+    # — New rules —
+    if dup_count > 0:
+        risk_score += 50
+        flags.append(
+            f"duplicate submission — same (user, transaction) seen "
+            f"{dup_count} time(s) this month"
+        )
+
+    if user_avg > 0 and amount > 2 * user_avg:
+        risk_score += 20
+        flags.append(
+            f"amount anomaly — £{amount:.2f} is {amount / user_avg:.1f}× "
+            f"user average £{user_avg:.2f}"
+        )
+
+    if recent_24h > 2:
+        risk_score += 25
+        flags.append(f"velocity spike — {recent_24h} requests in last 24 h (>2 threshold)")
+
+    if tx_user_count > 1:
+        risk_score += 40
+        flags.append(
+            f"transaction ID reuse — same transaction submitted by "
+            f"{tx_user_count} distinct users"
+        )
+
+    is_round = (amount > 0 and float(int(amount)) == amount and int(amount) % 50 == 0)
+    if is_round and monthly_count >= 2:
+        risk_score += 10
+        flags.append(
+            f"round-amount pattern — £{amount:.0f} with {monthly_count} monthly requests"
+        )
+
+    if total_count == 0 and amount > 200:
+        risk_score += 10
+        flags.append(
+            f"new-user high amount — first-ever request is £{amount:.2f} (>£200)"
+        )
+
     risk_score = min(risk_score, 99)
+
+    # ── ML anomaly detection (IsolationForest, optional) ─────────────────────
+    ml_anomaly_score: Optional[float] = None
+    ml_boost: int = 0
+    ml_model = _get_ml_model()
+    if ml_model is not None:
+        try:
+            amount_ratio = (amount / user_avg) if user_avg > 0 else 1.0
+            is_round_feat = 1.0 if is_round else 0.0
+            features = [[
+                amount,
+                float(monthly_count),
+                float(recent_24h),
+                amount_ratio,
+                is_round_feat,
+                float(tx_user_count),
+                float(dup_count),
+            ]]
+            ml_anomaly_score = float(ml_model.decision_function(features)[0])
+            # decision_function: more negative → more anomalous
+            if ml_anomaly_score < -0.1:
+                ml_boost = int(min(20, abs(ml_anomaly_score) * 40))
+                risk_score = min(risk_score + ml_boost, 99)
+                flags.append(
+                    f"ML anomaly signal {ml_anomaly_score:.3f} → +{ml_boost} risk"
+                )
+                logs.append(
+                    f"🤖 [ML] IsolationForest score: {ml_anomaly_score:.3f} "
+                    f"(+{ml_boost} risk)"
+                )
+        except Exception as ml_exc:
+            logs.append(f"⚠️  [ML] Anomaly detection unavailable: {ml_exc}")
 
     if flags:
         logs.append(f"⚠️  [Risk Auditor] Risk flags: {'; '.join(flags)}")
@@ -225,6 +334,8 @@ def risk_auditor_node(state: FinanceState) -> dict:
         monthly_refund_count=monthly_count,
         auto_rejected=auto_rejected,
         llm_insight=llm_insight,
+        ml_anomaly_score=ml_anomaly_score,
+        ml_boost=ml_boost,
         details=details,
     )
 
@@ -237,6 +348,16 @@ def risk_auditor_node(state: FinanceState) -> dict:
 
     database.update_refund_status(request_id, "awaiting_approval", report.risk_score)
     logs.append("⏸️  [Risk Auditor] Routing to executor — awaiting human approval.")
+
+    # ── Fire HITL notification on all configured channels ─────────────────────
+    notifications.send_hitl_notification(
+        request_id=request_id,
+        user_id=user_id,
+        amount=amount,
+        transaction_id=transaction_id,
+        risk_score=report.risk_score,
+        app_url=os.getenv("STREAMLIT_APP_URL", ""),
+    )
 
     return {
         "risk_score": report.risk_score,
@@ -306,7 +427,10 @@ def executor_node(state: FinanceState) -> dict:
 
     if is_mock:
         mock_id = f"re_mock_{request.get('transaction_id', 'unknown')}"
-        logs.append(f"💳 [Executor] [MOCK] Refund created: {mock_id} — £{request.get('amount', 0):.2f}")
+        logs.append(
+            f"💳 [Executor] [MOCK] Refund created: {mock_id} — "
+            f"£{request.get('amount', 0):.2f}"
+        )
         database.log_audit(request_id, "Executor", "refund_created", f"Mock refund ID: {mock_id}")
         database.update_refund_status(request_id, "executed", stripe_refund_id=mock_id)
         return {"audit_logs": logs, "status": "executed", "stripe_refund_id": mock_id}
