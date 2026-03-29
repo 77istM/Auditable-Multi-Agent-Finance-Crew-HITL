@@ -13,6 +13,14 @@ stripe-agent-toolkit==0.7.0
 
 # UI
 streamlit==1.55.0
+plotly>=5.0.0
+
+# Database — psycopg2 used when DATABASE_URL is set (Neon / PostgreSQL)
+psycopg2-binary>=2.9.9
+
+# ML anomaly detection — IsolationForest risk layer
+scikit-learn>=1.3.0
+joblib>=1.3.0
 
 # Utilities
 python-dotenv==1.2.2
